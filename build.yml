@@ -1,0 +1,800 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Generate project
+        run: |
+          set -e
+          mkdir -p proj && cd proj
+          mkdir -p "app"
+          cat > "app/build.gradle.kts" <<'NYANGIPLE_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.nyangiple.app"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.nyangiple.app"
+                  minSdk = 24
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          NYANGIPLE_EOF
+          mkdir -p "app/src/main"
+          cat > "app/src/main/AndroidManifest.xml" <<'NYANGIPLE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <!-- 파일/사진/동영상 업로드용 접근 권한 -->
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="냥이플"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/Theme.Nyangiple">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|density"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          NYANGIPLE_EOF
+          mkdir -p "app/src/main/java/com/nyangiple/app"
+          cat > "app/src/main/java/com/nyangiple/app/MainActivity.kt" <<'NYANGIPLE_EOF'
+          package com.nyangiple.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.View
+          import android.view.ViewGroup
+          import android.webkit.CookieManager
+          import android.webkit.PermissionRequest
+          import android.webkit.ValueCallback
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.FrameLayout
+          import android.widget.ImageButton
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+          import androidx.core.view.ViewCompat
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+
+          class MainActivity : AppCompatActivity() {
+
+              private val homeUrl = "https://khw150123.github.io/Nyangiple/"
+              private val barColor = 0xFF171C22.toInt()
+
+              private lateinit var webView: WebView
+              private lateinit var splash: View
+              private lateinit var bottomBar: View
+              private lateinit var fullscreenContainer: FrameLayout
+              private lateinit var btnBack: ImageButton
+              private lateinit var btnForward: ImageButton
+
+              private var customView: View? = null
+              private var customViewCallback: WebChromeClient.CustomViewCallback? = null
+
+              // ---- 파일 업로드 / 접근 권한 ----
+              private var filePathCallback: ValueCallback<Array<Uri>>? = null
+              private var pendingWebPermission: PermissionRequest? = null
+
+              private val fileChooserLauncher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                      val uris: Array<Uri>? =
+                          WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                      filePathCallback?.onReceiveValue(uris)
+                      filePathCallback = null
+                  }
+
+              private val appPermissionLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+
+              private val webPermissionLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                      val req = pendingWebPermission
+                      pendingWebPermission = null
+                      if (req != null) {
+                          val allowed = req.resources.filter { r ->
+                              when (r) {
+                                  PermissionRequest.RESOURCE_VIDEO_CAPTURE -> isGranted(Manifest.permission.CAMERA)
+                                  PermissionRequest.RESOURCE_AUDIO_CAPTURE -> isGranted(Manifest.permission.RECORD_AUDIO)
+                                  else -> true
+                              }
+                          }
+                          if (allowed.isEmpty()) req.deny() else req.grant(allowed.toTypedArray())
+                      }
+                  }
+
+              private fun isGranted(permission: String): Boolean =
+                  ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+              private fun requestAppPermissions() {
+                  val list = mutableListOf<String>()
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      list += Manifest.permission.READ_MEDIA_IMAGES
+                      list += Manifest.permission.READ_MEDIA_VIDEO
+                  } else {
+                      list += Manifest.permission.READ_EXTERNAL_STORAGE
+                  }
+                  val missing = list.filter { !isGranted(it) }
+                  if (missing.isNotEmpty()) appPermissionLauncher.launch(missing.toTypedArray())
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  // 상태바(노치 영역)/하단 내비게이션바 색상 #171C22
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  @Suppress("DEPRECATION")
+                  run {
+                      window.statusBarColor = barColor
+                      window.navigationBarColor = barColor
+                  }
+                  WindowInsetsControllerCompat(window, window.decorView).apply {
+                      isAppearanceLightStatusBars = false
+                      isAppearanceLightNavigationBars = false
+                  }
+
+                  setContentView(R.layout.activity_main)
+
+                  val root = findViewById<View>(R.id.root)
+                  ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+                      val bars = insets.getInsets(
+                          WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+                      )
+                      val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+                      v.setPadding(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
+                      insets
+                  }
+
+                  webView = findViewById(R.id.webView)
+                  splash = findViewById(R.id.splash)
+                  bottomBar = findViewById(R.id.bottomBar)
+                  fullscreenContainer = findViewById(R.id.fullscreenContainer)
+                  btnBack = findViewById(R.id.btnBack)
+                  btnForward = findViewById(R.id.btnForward)
+
+                  setupWebView()
+
+                  btnBack.setOnClickListener { if (webView.canGoBack()) webView.goBack() }
+                  btnForward.setOnClickListener { if (webView.canGoForward()) webView.goForward() }
+                  findViewById<View>(R.id.btnHome).setOnClickListener { webView.loadUrl(homeUrl) }
+                  findViewById<View>(R.id.btnRefresh).setOnClickListener { webView.reload() }
+
+                  if (savedInstanceState != null) {
+                      webView.restoreState(savedInstanceState)
+                      splash.visibility = View.GONE
+                  } else {
+                      webView.loadUrl(homeUrl)
+                      // 스플래시 1초 후 사이트 화면으로 (그동안 뒤에서 사이트 로딩)
+                      Handler(Looper.getMainLooper()).postDelayed({ splash.visibility = View.GONE }, 1000)
+                      requestAppPermissions()
+                  }
+                  updateNavButtons()
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun setupWebView() {
+                  webView.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      databaseEnabled = true
+                      mediaPlaybackRequiresUserGesture = false
+                      mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                      allowFileAccess = true
+                      loadWithOverviewMode = true
+                      useWideViewPort = true
+                      javaScriptCanOpenWindowsAutomatically = true
+                      setSupportMultipleWindows(false)
+                  }
+                  CookieManager.getInstance().apply {
+                      setAcceptCookie(true)
+                      setAcceptThirdPartyCookies(webView, true)
+                  }
+
+                  webView.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                          val scheme = request.url.scheme ?: return false
+                          if (scheme in listOf("http", "https", "file", "about", "data", "blob", "javascript")) return false
+                          try {
+                              startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(request.url.toString())))
+                          } catch (_: Exception) {
+                          }
+                          return true
+                      }
+
+                      override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) = updateNavButtons()
+                      override fun onPageFinished(view: WebView, url: String?) = updateNavButtons()
+                      override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) = updateNavButtons()
+                  }
+
+                  // 동영상 전체화면 지원
+                  webView.webChromeClient = object : WebChromeClient() {
+                      override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+                          if (customView != null) {
+                              callback.onCustomViewHidden()
+                              return
+                          }
+                          customView = view
+                          customViewCallback = callback
+                          fullscreenContainer.addView(
+                              view,
+                              FrameLayout.LayoutParams(
+                                  ViewGroup.LayoutParams.MATCH_PARENT,
+                                  ViewGroup.LayoutParams.MATCH_PARENT
+                              )
+                          )
+                          fullscreenContainer.visibility = View.VISIBLE
+                          bottomBar.visibility = View.GONE
+                          WindowInsetsControllerCompat(window, window.decorView).apply {
+                              systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                              hide(WindowInsetsCompat.Type.systemBars())
+                          }
+                      }
+
+                      override fun onHideCustomView() = exitFullscreen()
+
+                      // 파일/사진/동영상 업로드 (input type=file)
+                      override fun onShowFileChooser(
+                          webView: WebView,
+                          callback: ValueCallback<Array<Uri>>,
+                          params: FileChooserParams
+                      ): Boolean {
+                          filePathCallback?.onReceiveValue(null)
+                          filePathCallback = callback
+                          return try {
+                              fileChooserLauncher.launch(params.createIntent())
+                              true
+                          } catch (e: Exception) {
+                              filePathCallback = null
+                              callback.onReceiveValue(null)
+                              false
+                          }
+                      }
+
+                      // 사이트가 카메라/마이크 접근을 요청할 때
+                      override fun onPermissionRequest(request: PermissionRequest) {
+                          runOnUiThread {
+                              val needed = mutableListOf<String>()
+                              for (r in request.resources) {
+                                  when (r) {
+                                      PermissionRequest.RESOURCE_VIDEO_CAPTURE -> needed += Manifest.permission.CAMERA
+                                      PermissionRequest.RESOURCE_AUDIO_CAPTURE -> needed += Manifest.permission.RECORD_AUDIO
+                                  }
+                              }
+                              val missing = needed.filter { !isGranted(it) }
+                              if (missing.isEmpty()) {
+                                  request.grant(request.resources)
+                              } else {
+                                  pendingWebPermission?.deny()
+                                  pendingWebPermission = request
+                                  webPermissionLauncher.launch(missing.toTypedArray())
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun exitFullscreen() {
+                  val view = customView ?: return
+                  fullscreenContainer.removeView(view)
+                  fullscreenContainer.visibility = View.GONE
+                  bottomBar.visibility = View.VISIBLE
+                  customViewCallback?.onCustomViewHidden()
+                  customView = null
+                  customViewCallback = null
+                  WindowInsetsControllerCompat(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
+              }
+
+              private fun updateNavButtons() {
+                  btnBack.alpha = if (webView.canGoBack()) 1f else 0.35f
+                  btnForward.alpha = if (webView.canGoForward()) 1f else 0.35f
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  when {
+                      customView != null -> exitFullscreen()
+                      webView.canGoBack() -> webView.goBack()
+                      else -> @Suppress("DEPRECATION") super.onBackPressed()
+                  }
+              }
+
+              override fun onSaveInstanceState(outState: Bundle) {
+                  super.onSaveInstanceState(outState)
+                  webView.saveState(outState)
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  webView.onPause()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  webView.onResume()
+              }
+
+              override fun onDestroy() {
+                  webView.destroy()
+                  super.onDestroy()
+              }
+          }
+          NYANGIPLE_EOF
+          mkdir -p "app/src/main/res/drawable"
+          cat > "app/src/main/res/drawable/ic_back.xml" <<'NYANGIPLE_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M20,11H7.83l5.59,-5.59L12,4l-8,8 8,8 1.41,-1.41L7.83,13H20v-2z"/>
+          </vector>
+          NYANGIPLE_EOF
+          mkdir -p "app/src/main/res/drawable"
+          cat > "app/src/main/res/drawable/ic_forward.xml" <<'NYANGIPLE_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M12,4l-1.41,1.41L16.17,11H4v2h12.17l-5.58,5.59L12,20l8,-8z"/>
+          </vector>
+          NYANGIPLE_EOF
+          mkdir -p "app/src/main/res/drawable"
+          cat > "app/src/main/res/drawable/ic_home.xml" <<'NYANGIPLE_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z"/>
+          </vector>
+          NYANGIPLE_EOF
+          mkdir -p "app/src/main/res/drawable"
+          cat > "app/src/main/res/drawable/ic_refresh.xml" <<'NYANGIPLE_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFF" android:pathData="M17.65,6.35C16.2,4.9 14.21,4 12,4c-4.42,0 -7.99,3.58 -7.99,8s3.57,8 7.99,8c3.73,0 6.84,-2.55 7.73,-6h-2.08c-0.82,2.33 -3.04,4 -5.65,4 -3.31,0 -6,-2.69 -6,-6s2.69,-6 6,-6c1.66,0 3.14,0.69 4.22,1.78L13,11h7V4l-2.35,2.35z"/>
+          </vector>
+          NYANGIPLE_EOF
+          mkdir -p "app/src/main/res/layout"
+          cat > "app/src/main/res/layout/activity_main.xml" <<'NYANGIPLE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="#171C22">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:orientation="vertical">
+
+                  <FrameLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="0dp"
+                      android:layout_weight="1">
+
+                      <WebView
+                          android:id="@+id/webView"
+                          android:layout_width="match_parent"
+                          android:layout_height="match_parent" />
+
+                      <FrameLayout
+                          android:id="@+id/fullscreenContainer"
+                          android:layout_width="match_parent"
+                          android:layout_height="match_parent"
+                          android:background="#000000"
+                          android:visibility="gone" />
+                  </FrameLayout>
+
+                  <LinearLayout
+                      android:id="@+id/bottomBar"
+                      android:layout_width="match_parent"
+                      android:layout_height="52dp"
+                      android:background="#171C22"
+                      android:orientation="horizontal">
+
+                      <ImageButton
+                          android:id="@+id/btnBack"
+                          style="@style/BarButton"
+                          android:contentDescription="뒤로가기"
+                          android:src="@drawable/ic_back" />
+
+                      <ImageButton
+                          android:id="@+id/btnForward"
+                          style="@style/BarButton"
+                          android:contentDescription="앞으로가기"
+                          android:src="@drawable/ic_forward" />
+
+                      <ImageButton
+                          android:id="@+id/btnHome"
+                          style="@style/BarButton"
+                          android:contentDescription="홈"
+                          android:src="@drawable/ic_home" />
+
+                      <ImageButton
+                          android:id="@+id/btnRefresh"
+                          style="@style/BarButton"
+                          android:contentDescription="새로고침"
+                          android:src="@drawable/ic_refresh" />
+                  </LinearLayout>
+              </LinearLayout>
+
+              <ImageView
+                  android:id="@+id/splash"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:background="#FAFAFA"
+                  android:scaleType="centerCrop"
+                  android:src="@drawable/splash"
+                  android:contentDescription="냥이플" />
+          </FrameLayout>
+          NYANGIPLE_EOF
+          mkdir -p "app/src/main/res/values"
+          cat > "app/src/main/res/values/themes.xml" <<'NYANGIPLE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.Nyangiple" parent="Theme.AppCompat.Light.NoActionBar">
+                  <item name="android:statusBarColor">#171C22</item>
+                  <item name="android:navigationBarColor">#171C22</item>
+                  <item name="android:windowBackground">#171C22</item>
+                  <item name="android:windowLightStatusBar">false</item>
+              </style>
+
+              <style name="BarButton">
+                  <item name="android:layout_width">0dp</item>
+                  <item name="android:layout_height">match_parent</item>
+                  <item name="android:layout_weight">1</item>
+                  <item name="android:background">?android:attr/selectableItemBackgroundBorderless</item>
+                  <item name="android:scaleType">center</item>
+              </style>
+          </resources>
+          NYANGIPLE_EOF
+          cat > "build.gradle.kts" <<'NYANGIPLE_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          NYANGIPLE_EOF
+          cat > "gradle.properties" <<'NYANGIPLE_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          NYANGIPLE_EOF
+          cat > "settings.gradle.kts" <<'NYANGIPLE_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Nyangiple"
+          include(":app")
+          NYANGIPLE_EOF
+          mkdir -p app/src/main/res/drawable
+          base64 -d > app/src/main/res/drawable/splash.png <<'NYANGIPLE_B64'
+          iVBORw0KGgoAAAANSUhEUgAAAxIAAAW/CAMAAAAPSDXzAAAAwFBMVEX8/f37/ff9+/77+/37+/v8
+          +/j6+/f8+v36+vz6+vr7+vf6+vj6+vL9+fr7+f37+fr6+f78+fb8+Pz8+Pj99vn3/vn3/Pr2/Pr4
+          /PX5+/r3+/z5+/j4+/X0/vvx/vv0/Prx/Pvr/v3r/P3l/f3g/f35+v34+f34+fb49/n1+vr09/jv
+          +frk+Pva/P3R/P7U9PrG9Pu08fqx5e+Q3eyL1eWCyNhuzOFswdVWwtw0weRWu9Q4u+BbtcxNtdBF
+          ttM5t9rDom9IAAAl6ElEQVR42u3daXcax6KwbTRhJjEKBM08gwAxaIzG//+vnirk7Lw7OSv58H7Q
+          yfF17ZXYji3vtVDfVBXdXZ3KAn84T3kNQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIg
+          CZAEIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAFIAiQBkgBJgCRAEiAJkARI
+          AiQBkgBJgCRAEiAJkARIAiQBkgBJAJIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAk
+          QBKAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBCAJkARIAiQBkgBJgCRAEiAJ
+          kARIAiQBkgBJgCRAEiAJkARIAiQBSAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIA
+          SUgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEkAkgBJgCRAEiAJkARIAiQBkgBJ
+          gCRAEiAJkARIAiQBkgBJgCRAEoAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAE
+          IAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAFIAiQBkgBJgCRAEiAJkARIAiQB
+          kgBJgCRAEiAJkARIAiQBkgBJAJIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBJe
+          A5AESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAUgCJAGSAEmAJEASIAmQBEgCJAGS
+          AEmAJEASIAmQBEgCJAGSAEkAkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEoAk
+          QBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAEIAmQBEgCJAGSAEmAJEASIAmQBEgC
+          JAGSAEmAJEASIAmQBEgCJAFIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJAJIA
+          SYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBKSAEmAJEASIAmQBEgCJAGSAEmAJEAS
+          IAmQBEgCJAGSAEmAJEASgCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkAQgCZAE
+          SAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAUgCJAGSAEmAJEASIAmQBEgCJAGSAEmA
+          JEASIAmQBEgCJAGSAEkAkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEoAkQBIg
+          CZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZCE1wAkAZIASYAkQBIgCZAESAIkAZIASYAk
+          QBIgCZAESAIkAZIASQCSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASgCRAEiAJ
+          kARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkAQgCZAESAIkAZIASYAkQBIgCZAESAIkAZIA
+          SYAkQBIgCZAESAIkAUgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEkAkgBJgCRA
+          EiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEoAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIk
+          AZIASYAkQBIgCZCEJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBCAJkARIAiQB
+          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
+          CZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAEIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGS
+          AEmAJEASIAmQBEgCJAFIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJAJIASYAk
+          QBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBKSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQ
+          BEgCJAGSAEmAJEASgCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkAQgCZAESAIk
+          AZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAUgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEAS
+          IAmQBEgCJAGSAEkAkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEoAkQBIgCZAE
+          SAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZCE1wAkAZIASYAkQBIgCZAESAIkAZIASYAkQBIg
+          CZAESAIkAZIASQCSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASgCRAEiAJkARI
+          AiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkAQgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAk
+          QBIgCZAESAIkAUgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEkAkgBJgCRAEiAJ
+          kARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEoAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIA
+          SYAkQBIgCZCEJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBCAJkARIAiQBkgBJ
+          gCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBSAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAE
+          SAIkAZIASQCSAEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBEgCJAGSAEmAJEASgCRAEiAJkARIAiQB
+          kgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJkAQgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIg
+          CZAESAIk4TUASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBKAJEASIAmQBEgCJAGS
+          AEmAJEASIAmQBEgCJAGSAEmAJEASIAmQBCAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRAEiAJ
+          kARIAiQBSAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASQCSAEmAJEASIAmQBEgC
+          JAGSAEmAJEASIAmQBEgCJAGSAEmAJEASgCRAEiAJkARIAiQBkgBJgCRAEiAJkARIAiQBkgBJgCRA
+          EiAJkAQgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkIQmQBEgCJAGSAEmAJEAS
+          IAmQBEgCJAGSAEmAJEASIAmQBEgCJAFkz/8faXwCY6mSDTEAAAAASUVORK5CYII=
+          NYANGIPLE_B64
+          base64 -d > icon_src.png <<'NYANGIPLE_ICON'
+          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
+          x/8HdziAc46I3D4AAAAASUVORK5CYII=
+          NYANGIPLE_ICON
+          # 앱 아이콘: 준비한 아이콘 이미지를 그대로 사용
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          cp icon_src.png app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nyangiple-apk
+          path: proj/app/build/outputs/apk/debug/*.apk
