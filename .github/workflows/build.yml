@@ -61,6 +61,18 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+              <!-- 파일/사진/동영상 업로드용 접근 권한 -->
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+              <uses-feature android:name="android.hardware.camera" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
               <application
                   android:allowBackup="true"
                   android:icon="@mipmap/ic_launcher"
@@ -86,16 +98,21 @@ jobs:
           cat > "app/src/main/java/com/nyangiple/app/MainActivity.kt" <<'NYANGIPLE_EOF'
           package com.nyangiple.app
 
+          import android.Manifest
           import android.annotation.SuppressLint
           import android.content.Intent
           import android.graphics.Bitmap
+          import android.content.pm.PackageManager
           import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
           import android.view.View
           import android.view.ViewGroup
           import android.webkit.CookieManager
+          import android.webkit.PermissionRequest
+          import android.webkit.ValueCallback
           import android.webkit.WebChromeClient
           import android.webkit.WebResourceRequest
           import android.webkit.WebSettings
@@ -103,7 +120,9 @@ jobs:
           import android.webkit.WebViewClient
           import android.widget.FrameLayout
           import android.widget.ImageButton
+          import androidx.activity.result.contract.ActivityResultContracts
           import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
           import androidx.core.view.ViewCompat
           import androidx.core.view.WindowCompat
           import androidx.core.view.WindowInsetsCompat
@@ -123,6 +142,52 @@ jobs:
 
               private var customView: View? = null
               private var customViewCallback: WebChromeClient.CustomViewCallback? = null
+
+              // ---- 파일 업로드 / 접근 권한 ----
+              private var filePathCallback: ValueCallback<Array<Uri>>? = null
+              private var pendingWebPermission: PermissionRequest? = null
+
+              private val fileChooserLauncher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                      val uris: Array<Uri>? =
+                          WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                      filePathCallback?.onReceiveValue(uris)
+                      filePathCallback = null
+                  }
+
+              private val appPermissionLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+
+              private val webPermissionLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+                      val req = pendingWebPermission
+                      pendingWebPermission = null
+                      if (req != null) {
+                          val allowed = req.resources.filter { r ->
+                              when (r) {
+                                  PermissionRequest.RESOURCE_VIDEO_CAPTURE -> isGranted(Manifest.permission.CAMERA)
+                                  PermissionRequest.RESOURCE_AUDIO_CAPTURE -> isGranted(Manifest.permission.RECORD_AUDIO)
+                                  else -> true
+                              }
+                          }
+                          if (allowed.isEmpty()) req.deny() else req.grant(allowed.toTypedArray())
+                      }
+                  }
+
+              private fun isGranted(permission: String): Boolean =
+                  ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+              private fun requestAppPermissions() {
+                  val list = mutableListOf<String>()
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      list += Manifest.permission.READ_MEDIA_IMAGES
+                      list += Manifest.permission.READ_MEDIA_VIDEO
+                  } else {
+                      list += Manifest.permission.READ_EXTERNAL_STORAGE
+                  }
+                  val missing = list.filter { !isGranted(it) }
+                  if (missing.isNotEmpty()) appPermissionLauncher.launch(missing.toTypedArray())
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -172,6 +237,7 @@ jobs:
                       webView.loadUrl(homeUrl)
                       // 스플래시 1초 후 사이트 화면으로 (그동안 뒤에서 사이트 로딩)
                       Handler(Looper.getMainLooper()).postDelayed({ splash.visibility = View.GONE }, 1000)
+                      requestAppPermissions()
                   }
                   updateNavButtons()
               }
@@ -236,6 +302,45 @@ jobs:
                       }
 
                       override fun onHideCustomView() = exitFullscreen()
+
+                      // 파일/사진/동영상 업로드 (input type=file)
+                      override fun onShowFileChooser(
+                          webView: WebView,
+                          callback: ValueCallback<Array<Uri>>,
+                          params: FileChooserParams
+                      ): Boolean {
+                          filePathCallback?.onReceiveValue(null)
+                          filePathCallback = callback
+                          return try {
+                              fileChooserLauncher.launch(params.createIntent())
+                              true
+                          } catch (e: Exception) {
+                              filePathCallback = null
+                              callback.onReceiveValue(null)
+                              false
+                          }
+                      }
+
+                      // 사이트가 카메라/마이크 접근을 요청할 때
+                      override fun onPermissionRequest(request: PermissionRequest) {
+                          runOnUiThread {
+                              val needed = mutableListOf<String>()
+                              for (r in request.resources) {
+                                  when (r) {
+                                      PermissionRequest.RESOURCE_VIDEO_CAPTURE -> needed += Manifest.permission.CAMERA
+                                      PermissionRequest.RESOURCE_AUDIO_CAPTURE -> needed += Manifest.permission.RECORD_AUDIO
+                                  }
+                              }
+                              val missing = needed.filter { !isGranted(it) }
+                              if (missing.isEmpty()) {
+                                  request.grant(request.resources)
+                              } else {
+                                  pendingWebPermission?.deny()
+                                  pendingWebPermission = request
+                                  webPermissionLauncher.launch(missing.toTypedArray())
+                              }
+                          }
+                      }
                   }
               }
 
@@ -604,17 +709,79 @@ jobs:
           EiAJkAQgCZAESAIkAZIASYAkQBIgCZAESAIkAZIASYAkQBIgCZAESAIkIQmQBEgCJAGSAEmAJEAS
           IAmQBEgCJAGSAEmAJEASIAmQBEgCJAFkz/8faXwCY6mSDTEAAAAASUVORK5CYII=
           NYANGIPLE_B64
-          # 앱 아이콘: 스플래시의 고양이 얼굴을 잘라서 생성
-          pip install pillow -q
-          python3 - <<'NYANGIPLE_PY'
-          from PIL import Image
-          im = Image.open('app/src/main/res/drawable/splash.png').convert('RGB')
-          c = im.crop((396, 685, 486, 775))
-          for d, s in [('mdpi', 48), ('hdpi', 72), ('xhdpi', 96), ('xxhdpi', 144), ('xxxhdpi', 192)]:
-              import os
-              os.makedirs(f'app/src/main/res/mipmap-{d}', exist_ok=True)
-              c.resize((s, s), Image.LANCZOS).save(f'app/src/main/res/mipmap-{d}/ic_launcher.png')
-          NYANGIPLE_PY
+          base64 -d > icon_src.png <<'NYANGIPLE_ICON'
+          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
+          x/8HdziAc46I3D4AAAAASUVORK5CYII=
+          NYANGIPLE_ICON
+          # 앱 아이콘: 준비한 아이콘 이미지를 그대로 사용
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          cp icon_src.png app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
       - name: Accept Android licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
